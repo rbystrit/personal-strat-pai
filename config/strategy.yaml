@@ -1,0 +1,32 @@
+# Strategy parameters — D7 conservative defaults (plan §9.2).
+# All values are the most conservative end of each band (tightest stops, highest
+# hurdles => most capital protection, least turnover/whipsaw). CEO-editable; live
+# tuning of any value is a CEO-approved commit (plan §9.2).
+
+# L4 tax hurdle (ΔH) — profit-weighted momentum spread hurdle (brief §3 L4).
+delta_h_st: 0.08   # short-term hurdle 8% (band 6–8%)
+delta_h_lt: 0.04   # long-term hurdle 4% (band 3–4%)
+
+# IV-rank-scaled dynamic stops (brief §4; plan §9 risk/stops.py).
+stop_iv_rank_low: 0.05   # IV rank <50: 5%
+stop_iv_rank_high: 0.08  # IV rank >=50: 8% (band 7–8%)
+stop_crypto: 0.15        # crypto: 15% (band 12–15% or 3×ATR — tighter of the two)
+
+# Blended ROC = 0.5·ROC3M + 0.5·ROC6M (brief §3 Layer 3).
+roc_weight_3m: 0.5
+roc_weight_6m: 0.5
+
+# Absolute regime voting ensemble (brief §3 Layer 2).
+regime_windows_sectors: [3, 6, 9, 12]   # >=3 of 4 (75% consensus)
+regime_votes_sectors: 3
+regime_windows_crypto: [1, 2, 3]        # >=2 of 3 (66% consensus)
+regime_votes_crypto: 2
+
+# Allocation (brief §5).
+nav_cap: 0.40        # 40% absolute NAV cap (20% under FIRF — see risk_limits.yaml)
+nav_cap_firf: 0.20   # FIRF macro circuit breaker cap (plan §6.3)
+beta_ceiling: 1.35   # portfolio beta ceiling (de-risk into lowest-beta passing assets)
+waterfall: [0.5, 0.3, 0.2]   # 50/30/20 cash deployment (Rank 1/2/3)
+
+# IV proxy / smoke detector (plan §6.2).
+put_skew_extreme_percentile: 90.0   # extreme put skew >= 90th pct of 12m

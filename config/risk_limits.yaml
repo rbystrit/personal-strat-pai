@@ -1,0 +1,21 @@
+# Risk limits — hard limits (plan §12). Capital preservation is priority #1.
+# Changes require an explicit CEO-approved commit (logged). The kill_switch flag
+# is armable by CEO or by automated breach detectors (plan §12).
+
+# D8 literal (plan §1, §9.1): $10,000 monthly fresh cash injection into the pool.
+monthly_cash_injection: 10000.0
+
+# --- D8 CEO-SET values (plan §18) — placeholders until Phase 1 live capital --- #
+# These three remain CEO-set; collect via ask_user_questions before Phase 1 (roadmap §62).
+# Paper trading (Phase 0) may proceed with them set to null.
+starting_capital: null            # CEO-SET — initial account balance ($)
+account_dd_stop_pct: null         # CEO-SET — account-level drawdown stop (decimal, e.g. 0.20)
+per_ticker_max_shares: null       # CEO-SET — {ticker: max_shares}; null = not yet set
+
+# Hard position/exposure limits (plan §12).
+max_bucket_weight: 0.40           # per-bucket max weight (<=40%)
+max_bucket_weight_firf: 0.20      # per-bucket max weight under FIRF (<=20%)
+max_gross_exposure_to_nav: 1.0    # long-only, unlevered (gross <= NAV)
+beta_ceiling: 1.35                # portfolio beta ceiling (re-checked post-fill)
+kill_switch_default: false        # default state; armable by CEO / breach detectors
+recon_tolerance: 0.01             # nightly reconciliation mismatch tolerance ($)

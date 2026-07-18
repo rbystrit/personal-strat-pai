@@ -1,0 +1,111 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "personal-strat-pai"
+version = "0.1.0"
+description = "Flat Momentum Strategy trading system — IBKR execution, Oracle Cloud durable storage, polars-first data layer."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Proprietary" }
+authors = [{ name = "Rbystrit — Founding Quant Trading Engineer" }]
+
+# Runtime deps — polars-first (D14); pandas only at interop boundaries.
+dependencies = [
+    "polars>=1.9",
+    "pyarrow>=17.0",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "pyyaml>=6.0",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "structlog>=24.4",
+    "databento>=0.80.0",
+    "yfinance>=0.2.43",
+    "pandas>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "hypothesis>=6.112",
+    "ruff>=0.7",
+    "mypy>=1.13",
+]
+
+[project.scripts]
+personal-strat-pai = "personal_strat_pai.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/personal_strat_pai"]
+
+# --- uv (D13) --- #
+[tool.uv]
+required-version = ">=0.5"
+
+# --- ruff --- #
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["data/local", "*.parquet"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "PL"]
+ignore = [
+    "PLR0913",  # too-many-arguments — fine for data-layer fns with explicit options
+    "PLR2004",  # magic-value — noisy in tests/config defaults
+    "E501",     # line-too-long handled by formatter
+    # Ambiguous unicode — this codebase intentionally uses math notation
+    # (×, ≤, ≥, β, Δ, §, –, →) in docstrings/comments; not errors.
+    "RUF001", "RUF002", "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR2004", "S101", "PLC0415"]  # assertions, magic values, deferred imports ok in tests
+# CLI deliberately defers heavy data-stack imports so trivial subcommands
+# (config-show) stay fast; PLC0415 (import outside top-level) is intentional.
+"src/personal_strat_pai/cli.py" = ["PLC0415"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# --- mypy --- #
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+packages = ["personal_strat_pai"]
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+no_implicit_reexport = true
+exclude = ["tests/data/"]
+
+# Third-party libs without typed stubs — interop boundaries (plan §5, D14).
+[[tool.mypy.overrides]]
+module = [
+    "databento.*",
+    "yfinance.*",
+    "scipy.*",
+    "yaml.*",
+    "pandas.*",
+]
+ignore_missing_imports = true
+
+# --- pytest --- #
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config -m 'not integration'"
+markers = [
+    "integration: tests hitting live databento / yfinance / OCI (opt-in via -m integration)",
+]
+asyncio_mode = "auto"
+filterwarnings = ["error"]
+
+# --- hatch version --- #
+[tool.hatch.version]
+path = "src/personal_strat_pai/__init__.py"

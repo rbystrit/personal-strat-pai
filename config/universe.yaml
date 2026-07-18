@@ -1,0 +1,91 @@
+# Universe — 13-bucket × 3-ETF matrix + parking lot (brief §2; plan §4, §9).
+# Static pre-verified whitelist for v1–v3 (D9). Full N-CEN/N-PORT/485BPOS engine is v4.
+# Anti-PIMCO Sovereign Rule (brief §2) enforced in config.py (PIMCO_BLOCKLIST).
+
+buckets:
+  - id: 1
+    name: Basic Materials
+    etf_a: XLB
+    etf_b: RSPM
+    etf_c: XME
+    gics_sector: Materials
+  - id: 2
+    name: Communication Services
+    etf_a: XLC
+    etf_b: RSPC
+    etf_c: IYZ
+    gics_sector: Communication Services
+  - id: 3
+    name: Consumer Cyclical
+    etf_a: XLY
+    etf_b: RSPD
+    etf_c: XHB
+    gics_sector: Consumer Discretionary
+  - id: 4
+    name: Consumer Defensive
+    etf_a: XLP
+    etf_b: RSPS
+    etf_c: PBJ
+    gics_sector: Consumer Staples
+  - id: 5
+    name: Energy
+    etf_a: XLE
+    etf_b: XOP
+    etf_c: OIH
+    gics_sector: Energy
+  - id: 6
+    name: Financial Services
+    etf_a: XLF
+    etf_b: KBWB
+    etf_c: KRE
+    gics_sector: Financials
+  - id: 7
+    name: Healthcare
+    etf_a: XLV
+    etf_b: XBI
+    etf_c: IHI
+    gics_sector: Health Care
+  - id: 8
+    name: Industrials
+    etf_a: XLI
+    etf_b: PAVE
+    etf_c: ITA
+    gics_sector: Industrials
+  - id: 9
+    name: Real Estate
+    etf_a: VNQ
+    etf_b: XLRE
+    etf_c: DTCR
+    gics_sector: Real Estate
+    firf_capped: true        # FIRF caps at 20% NAV (plan §6.3)
+  - id: 10
+    name: Technology
+    etf_a: XLK
+    etf_b: SMH
+    etf_c: IGV
+    gics_sector: Information Technology
+    firf_capped: true        # FIRF caps at 20% NAV (plan §6.3)
+  - id: 11
+    name: Utilities
+    etf_a: XLU
+    etf_b: RSPU
+    etf_c: UTES
+    gics_sector: Utilities
+  - id: 12
+    name: Macro Bond Duration
+    etf_a: TLT
+    etf_b: SPTL
+    etf_c: EDV
+    gics_sector: Fixed Income
+  - id: 13
+    name: Crypto
+    etf_a: IBIT
+    etf_b: ETHA
+    etf_c: GSOL
+    is_crypto: true
+    firf_capped: true        # FIRF caps at 20% NAV (plan §6.3)
+
+parking_lot:
+  muni_tickers: [SUB, VTES]     # TEY-based sweep (brief §4)
+  treasury_tickers: [SGOV]      # 0–3M T-bill ETFs
+  max_exception_days: 7         # 5–7 day parking exception (plan §9 risk/parking_lot.py)

@@ -1,0 +1,34 @@
+# Python / uv
+.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test / type / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.cache/
+
+# Env / secrets (never commit)
+.env
+.env.local
+*.pem
+*.key
+
+# Local data artifacts (parquet + SQLite read cache) — never commit data
+data/local/
+*.parquet
+*.duckdb
+*.sqlite
+*.sqlite3
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
