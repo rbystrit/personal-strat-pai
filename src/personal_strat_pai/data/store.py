@@ -12,6 +12,13 @@ Backing store: local filesystem is fully implemented and tested in CI. The OCI
 Object Storage backend is wired in P0-2 once creds/namespace are configured; the
 interface (``base_uri`` accepting ``file://`` or ``oci://``) is ready for it.
 
+No-double-download (CEO directive 2026-07-18): ``upsert_bars`` is the
+idempotent merge path — new rows are merged into existing partitions by
+``(symbol, ts)`` (keep-latest) so re-fetching an overlapping range never
+duplicates rows. ``coverage`` returns the per-symbol ``(first_ts, last_ts)``
+so the caching repo (data/repo.py) can compute the missing range to fetch
+without re-downloading anything already in the store.
+
 SQLite read cache: the podman primary's hot read path (plan §6.1 — last ~260
 trading days for 200D SMA / 12m ROC). ``SQLiteCache`` is a working read-through
 cache; the write-through wiring on ingest is P0-2/P0-4.
@@ -19,6 +26,7 @@ cache; the write-through wiring on ingest is P0-2/P0-4.
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
@@ -37,11 +45,13 @@ from personal_strat_pai.data.polars_utils import (
 __all__ = [
     "BarKind",
     "BarStore",
+    "Coverage",
     "OciBackendNotConfigured",
     "SQLiteCache",
 ]
 
 BarKind = Literal["daily", "minute"]
+Coverage = tuple[datetime, datetime]
 
 
 class OciBackendNotConfigured(NotImplementedError):
@@ -140,6 +150,108 @@ class BarStore:
     ) -> pl.DataFrame:
         """Eager read — collect at the boundary. Use for small slices / pre-trade checks."""
         return collect_eager(self.scan_bars(kind, symbols=symbols, start=start, end=end))
+
+    def upsert_bars(
+        self,
+        df: pl.DataFrame,
+        kind: BarKind = "daily",
+        *,
+        compression: Literal["zstd", "snappy", "gzip"] = "zstd",
+    ) -> dict[str, int]:
+        """Idempotent upsert — merge ``df`` into existing partitions by ``(symbol, ts)``.
+
+        CEO directive 2026-07-18 (no piece of data downloaded twice): the caching
+        repo fetches only the missing range and calls ``upsert_bars`` so re-fetching
+        an overlapping range is a no-op (keep-latest on ``(symbol, ts)``), never a
+        duplicate. Per-symbol: read the existing partition, concat with the new
+        rows, unique by ``(symbol, ts)`` keeping the new (latest) rows, sort by ts,
+        then rewrite the partition. Returns ``{symbol: rows_in_partition_after}``.
+        """
+        assert_eager(df, "BarStore.upsert_bars")
+        self._validate_bar_schema(df)
+        target = self._kind_dir(kind)
+        target.mkdir(parents=True, exist_ok=True)
+        result: dict[str, int] = {}
+        for sym in df["symbol"].unique().sort().to_list():
+            new_rows = df.filter(pl.col("symbol") == sym)
+            existing = self._read_partition(kind, sym)
+            if existing.is_empty() and new_rows.is_empty():
+                result[sym] = 0
+                continue
+            merged = (
+                pl.concat([existing, new_rows], how="vertical_relaxed")
+                .unique(subset=["symbol", "ts"], keep="last")
+                .sort(["ts"])
+            )
+            self._rewrite_partition(target, sym, merged, compression=compression)
+            result[sym] = merged.height
+        return result
+
+    def coverage(
+        self,
+        kind: BarKind = "daily",
+        *,
+        symbols: list[str] | None = None,
+    ) -> dict[str, Coverage]:
+        """Per-symbol ``(first_ts, last_ts)`` from the store (CEO no-double-download).
+
+        Eager, small aggregation — drives the caching repo's missing-range
+        computation. Returns ``{}`` for an empty store. Datetimes are tz-aware UTC.
+        """
+        kind_dir = self._kind_dir(kind)
+        if not kind_dir.exists():
+            return {}
+        lf = pl.scan_parquet(kind_dir, hive_partitioning=True)
+        if symbols is not None:
+            lf = lf.filter(pl.col("symbol").is_in(symbols))
+        agg = (
+            lf.group_by("symbol")
+            .agg(
+                pl.col("ts").min().alias("first_ts"),
+                pl.col("ts").max().alias("last_ts"),
+            )
+            .collect()
+        )
+        out: dict[str, Coverage] = {}
+        for row in agg.iter_rows(named=True):
+            out[row["symbol"]] = (row["first_ts"], row["last_ts"])
+        return out
+
+    def _read_partition(self, kind: BarKind, symbol: str) -> pl.DataFrame:
+        """Read a single symbol's partition eagerly (empty BAR_SCHEMA if missing).
+
+        Scans from the kind root with a symbol filter (the proven ``scan_bars``
+        pattern) so the hive ``symbol=<sym>`` key is reconstructed from the path
+        and the leaf files — which drop the partition column when written via
+        ``partition_by`` — are read correctly.
+        """
+        kind_dir = self._kind_dir(kind)
+        part_dir = kind_dir / f"symbol={symbol}"
+        if not kind_dir.exists() or not part_dir.exists() or not any(part_dir.rglob("*.parquet")):
+            return pl.DataFrame(schema=BAR_SCHEMA)
+        return collect_eager(
+            pl.scan_parquet(kind_dir, hive_partitioning=True).filter(pl.col("symbol") == symbol)
+        ).select(list(BAR_COLUMNS))
+
+    @staticmethod
+    def _rewrite_partition(
+        kind_dir: Path,
+        symbol: str,
+        merged: pl.DataFrame,
+        *,
+        compression: Literal["zstd", "snappy", "gzip"],
+    ) -> None:
+        """Rewrite a single symbol's partition in the canonical hive layout.
+
+        Removes the existing ``symbol=<sym>`` partition dir, then writes the
+        merged frame with ``partition_by=["symbol"]`` so the leaf file drops the
+        partition column (matching ``write_bars``); hive scanning reconstructs
+        ``symbol`` from the path. Other symbols' partitions are untouched.
+        """
+        part_dir = kind_dir / f"symbol={symbol}"
+        if part_dir.exists():
+            shutil.rmtree(part_dir)
+        merged.write_parquet(kind_dir, partition_by=["symbol"], compression=compression)
 
     @staticmethod
     def _validate_bar_schema(df: pl.DataFrame) -> None:

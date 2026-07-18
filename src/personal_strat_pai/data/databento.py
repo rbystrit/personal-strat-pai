@@ -1,17 +1,28 @@
-"""databento primary data feed (plan §6.1, §6.2, §6.3, §6.4; D3).
+"""databento primary data feed (plan §6.1, §6.3, §6.4; D3).
 
 Primary source for:
   - historical + live bars (daily + minute) across the ~45-ETF universe (DBEQ),
-  - EOD options chain snapshot for the IV proxy (D2 — no OPRA),
   - SOFR/OIS forward curve (D3, delegated to data/rates.py),
   - corporate actions / splits (§6.4, system of record).
 
+IV (plan §6.2) is NOT sourced from databento here. Per CEO directive 2026-07-18
+(superseding design decision D2): for **backtesting**, IV is proxied by HV
+(historical volatility) computed from the bars we already ingest — no options
+data spend (OPRA is too expensive; the EOD-chain self-built IV path was
+dropped). For **live/paper**, IV/options come via IBKR (data/iv_proxy.py
+``IbkrIvProvider``). So this module no longer fetches or normalizes option
+chains.
+
 All live calls are gated behind ``DATABENTO_API_KEY`` and ``@pytest.mark.integration``
-in tests. The pure normalization helpers (``_normalize_bars``) are unit-tested
+in tests. The pure normalization helper (``normalize_bars``) is unit-tested
 with synthetic raw frames so the data layer is exercised in CI without spend.
 
 databento returns pandas DataFrames at the SDK boundary; this module converts to
 polars at the boundary with ``pl.from_pandas`` (plan §5, D14 interop rule).
+
+``DatabentoClient`` implements the ``BarFetcher`` protocol (data/repo.py) so the
+caching repo can compose it without re-downloading cached ranges (CEO directive
+2026-07-18: no piece of data downloaded twice).
 """
 
 from __future__ import annotations
@@ -25,15 +36,14 @@ import pandas as pd
 import polars as pl
 
 from personal_strat_pai.data.corp_actions import CorpAction
-from personal_strat_pai.data.iv_proxy import CHAIN_COLUMNS
 from personal_strat_pai.data.polars_utils import BAR_SCHEMA, EagerFrame
+from personal_strat_pai.data.store import BarKind
 
 __all__ = [
     "DATABENTO_DBEQ_DAILY",
     "DATABENTO_DBEQ_MINUTE",
     "DatabentoClient",
     "normalize_bars",
-    "normalize_option_chain",
 ]
 
 DATABENTO_DBEQ_DAILY = "DBEQ-BARS-1D"
@@ -82,26 +92,12 @@ def normalize_bars(raw: pl.DataFrame, *, bar_kind: str = "daily") -> pl.DataFram
     return out.select(list(BAR_SCHEMA.names()))
 
 
-def normalize_option_chain(raw: pl.DataFrame) -> pl.DataFrame:
-    """Normalize a raw databento EOD option chain to CHAIN_COLUMNS (plan §6.2, D2)."""
-    if raw.is_empty():
-        return pl.DataFrame(schema={c: pl.String for c in CHAIN_COLUMNS})
-    rename: dict[str, str] = {}
-    if "ts_event" in raw.columns:
-        rename["ts_event"] = "expiration"
-    if "strike_price" in raw.columns:
-        rename["strike_price"] = "strike"
-    if "instrument" in raw.columns and "type" not in raw.columns:
-        pass  # would derive call/put from instrument class
-    out = raw.rename(rename)
-    # type column: "C"/"P"
-    if "type" in out.columns:
-        out = out.with_columns(pl.col("type").cast(pl.String).str.slice(0, 1).str.to_uppercase())
-    return out.select(list(CHAIN_COLUMNS))
-
-
 class DatabentoClient:
-    """databento client (plan §6.1). Live calls integration-gated behind the API key."""
+    """databento client (plan §6.1). Live calls integration-gated behind the API key.
+
+    Implements the ``BarFetcher`` protocol (data/repo.py) via ``fetch_bars`` so
+    the caching repo can fetch only missing ranges without re-downloading.
+    """
 
     def __init__(
         self,
@@ -121,6 +117,19 @@ class DatabentoClient:
     def _historical(self) -> Any:  # pragma: no cover - integration
         return databento.Historical(key=self.api_key)
 
+    def fetch_bars(
+        self,
+        symbols: list[str],
+        start: date | str,
+        end: date | str,
+        *,
+        kind: BarKind = "daily",
+    ) -> EagerFrame:  # pragma: no cover - integration
+        """``BarFetcher`` protocol impl — dispatch to daily/minute by kind."""
+        dataset = self.daily_dataset if kind == "daily" else self.minute_dataset
+        raw = self._fetch_range(dataset, symbols, start, end)
+        return normalize_bars(_to_polars(raw), bar_kind=kind)
+
     def get_daily_bars(
         self, symbols: list[str], start: date | str, end: date | str
     ) -> EagerFrame:  # pragma: no cover - integration
@@ -132,15 +141,6 @@ class DatabentoClient:
     ) -> EagerFrame:  # pragma: no cover - integration
         raw = self._fetch_range(self.minute_dataset, symbols, start, end)
         return normalize_bars(_to_polars(raw), bar_kind="minute")
-
-    def get_eod_option_chain(
-        self, symbol: str, as_of: date | str
-    ) -> EagerFrame:  # pragma: no cover - integration
-        raise NotImplementedError(
-            "databento EOD options chain fetch (plan §6.2, D2) is wired in the "
-            "integration test path; the production loader lands with the live IV "
-            "ingest job. Use a synthetic chain for unit tests."
-        )
 
     def get_corp_actions(
         self, symbols: list[str], start: date | str, end: date | str

@@ -3,7 +3,9 @@
 P0-1 surface:
   config-show   — load + print the three configs (validates at startup).
   data-check    — run data-quality checks over a parquet bar store.
-  data-ingest   — databento -> parquet store (integration-gated; needs DATABENTO_API_KEY).
+  data-ingest   — databento -> parquet store via the caching BarRepo
+                  (no piece of data downloaded twice; CEO directive 2026-07-18).
+                  Integration-gated; needs DATABENTO_API_KEY.
 
 Later phases add: run-backtest, sec-audit, reconcile, arm-backup, lease-show
 (plan §4 cli.py). Kept minimal here so P0-1 ships a working entrypoint.
@@ -59,20 +61,35 @@ def _cmd_data_check(args: argparse.Namespace) -> int:
 def _cmd_data_ingest(args: argparse.Namespace) -> int:
     from personal_strat_pai.data.databento import DatabentoClient
     from personal_strat_pai.data.quality import validate_bars
+    from personal_strat_pai.data.repo import BarRepo
     from personal_strat_pai.data.store import BarStore
 
     universe = load_universe(Path(args.config_dir) / "universe.yaml" if args.config_dir else None)
     client = DatabentoClient()
     store = BarStore(args.base_uri)
+    repo = BarRepo(store, client, bootstrap_start=args.bootstrap_start)
     symbols = universe.all_tickers_with_parking()
-    print(f"ingesting {len(symbols)} symbols from databento -> {args.base_uri}")
-    df = client.get_daily_bars(symbols, args.start, args.end)
+    print(
+        f"ingesting {len(symbols)} symbols from databento -> {args.base_uri} "
+        f"(no-double-download; bootstrap_start={args.bootstrap_start}, end={args.end})"
+    )
+    # get_bars fetches only the missing ranges, upserts into the store, and
+    # returns a lazy scan of the requested range. Collect eagerly for the
+    # quality gate (boundary -> eager, D14(b)).
+    lazy = repo.get_bars(symbols, start=args.start, end=args.end, kind="daily")
+    df = lazy.collect()
+    if df.is_empty():
+        print(f"no rows fetched for {args.start}..{args.end}; check creds/range")
+        return 3
     report = validate_bars(df, raise_on_fail=False)
     if not report.passed:
-        print(f"data-quality FAIL — not writing: {report.summary()}")
+        print(f"data-quality FAIL — quarantining: {report.summary()}")
         return 3
-    written = store.write_bars(df, kind="daily")
-    print(f"wrote {len(written)} partition(s); {df.height} rows, {report.summary()}")
+    cov = repo.coverage(kind="daily", symbols=symbols)
+    print(
+        f"OK: {df.height} rows in [{args.start}, {args.end}); "
+        f"{len(cov)} symbols cached. {report.summary()}"
+    )
     return 0
 
 
@@ -93,11 +110,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_check.set_defaults(func=_cmd_data_check)
 
     p_ingest = sub.add_parser(
-        "data-ingest", help="databento -> parquet store (needs DATABENTO_API_KEY)."
+        "data-ingest",
+        help="databento -> parquet store via the caching BarRepo (needs DATABENTO_API_KEY).",
     )
     p_ingest.add_argument("--base-uri", default="data/local/bars")
-    p_ingest.add_argument("--start", required=True, help="ISO-8601 start date")
+    p_ingest.add_argument("--start", required=True, help="ISO-8601 start date (inclusive)")
     p_ingest.add_argument("--end", required=True, help="ISO-8601 end date (exclusive)")
+    p_ingest.add_argument(
+        "--bootstrap-start",
+        default="2000-01-01",
+        help="max-history floor for first-time pulls (CEO: bootstrap with max range available).",
+    )
     p_ingest.add_argument("--config-dir", default=None)
     p_ingest.set_defaults(func=_cmd_data_ingest)
 

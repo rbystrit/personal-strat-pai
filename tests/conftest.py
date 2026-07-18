@@ -7,7 +7,7 @@ Integration tests (live feeds) are opt-in via ``-m integration``.
 from __future__ import annotations
 
 import os
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -87,64 +87,30 @@ def synthetic_bars_lazy_df(tmp_bars_dir: Path) -> pl.DataFrame:
     return df
 
 
-def make_synthetic_option_chain(
-    symbol: str,
-    spot: float,
-    as_of: date,
+def make_synthetic_bars_range(
+    symbols: list[str],
+    start: datetime,
+    end: datetime,
     *,
-    iv_30d: float = 0.25,
-    iv_90d: float = 0.22,
-    r: float = 0.05,
-    n_strikes: int = 11,
-    strike_step: float = 5.0,
+    seed: int = 42,
+    start_price: float = 100.0,
 ) -> pl.DataFrame:
-    """Build a synthetic EOD option chain priced at known IV (for IV-proxy tests).
+    """Synthetic OHLCV daily bars over ``[start, end)`` (date-wise, UTC).
 
-    The 30D expiry options are priced at iv_30d; 90D at iv_90d. OTM puts have
-    extra skew (so put_skew_30d > 0). implied_vol should recover iv_30d/iv_90d.
+    Used by the caching-repo tests: a deterministic bar generator standing in
+    for a live ``BarFetcher`` so the no-double-download logic is exercised with
+    real parquet I/O in CI (no databento spend).
     """
-    from personal_strat_pai.data.iv_proxy import black_scholes_price
+    from personal_strat_pai.data.polars_utils import BAR_SCHEMA
 
-    rows: list[dict[str, Any]] = []
-    half = n_strikes // 2
-    for expiry_days, iv in ((30, iv_30d), (90, iv_90d)):
-        expiry = as_of + timedelta(days=expiry_days)
-        T = expiry_days / 365.0
-        atm_strike = round(spot / strike_step) * strike_step
-        for i in range(-half, half + 1):
-            strike = atm_strike + i * strike_step
-            for otype in ("C", "P"):
-                # OTM puts get a skew bump (higher IV) to exercise the put-skew path.
-                local_iv = iv
-                if otype == "P" and strike < spot:
-                    local_iv = iv + 0.02 * (1.0 - strike / spot) * 4.0
-                price = black_scholes_price(spot, strike, T, r, local_iv, otype)
-                # bid/ask around the mid with a tiny spread
-                spread = max(price * 0.005, 0.01)
-                rows.append(
-                    {
-                        "symbol": symbol,
-                        "expiration": expiry,
-                        "strike": float(strike),
-                        "type": otype,
-                        "bid": round(price - spread / 2, 4),
-                        "ask": round(price + spread / 2, 4),
-                    }
-                )
-    return pl.DataFrame(
-        rows,
-        schema={
-            "symbol": pl.String,
-            "expiration": pl.Date,
-            "strike": pl.Float64,
-            "type": pl.String,
-            "bid": pl.Float64,
-            "ask": pl.Float64,
-        },
-    )
+    if end <= start:
+        return pl.DataFrame(schema=BAR_SCHEMA)
+    days = (end - start).days
+    df = _synthetic_bars(symbols, start, days, seed=seed, start_price=start_price)
+    return df.cast({c: t for c, t in BAR_SCHEMA.items() if c in df.columns})
 
 
 @pytest.fixture
-def option_chain_factory():
-    """Factory fixture returning :func:`make_synthetic_option_chain`."""
-    return make_synthetic_option_chain
+def bars_range_factory():
+    """Factory fixture returning :func:`make_synthetic_bars_range`."""
+    return make_synthetic_bars_range

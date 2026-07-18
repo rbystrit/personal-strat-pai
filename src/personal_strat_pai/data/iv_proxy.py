@@ -1,379 +1,243 @@
-"""Self-built IV proxy from EOD options chain snapshot — NO OPRA (plan §6.2, D2).
+"""IV proxy — HV for backtesting, IBKR for live/paper (CEO directive 2026-07-18).
 
-We build implied volatility ourselves from a narrow end-of-day options chain
-snapshot (databento EOD options dataset — a fraction of OPRA cost) for the
-~45-ETF universe: 30-day and 90-day at-the-money IV plus a small put-skew
-sample. Black-Scholes inversion via scipy. No OPRA spend in v1.
+Supersedes design decision D2 (self-built IV from an EOD options chain snapshot,
+no OPRA). CEO feedback 2026-07-18 on RBY-4:
 
-Accuracy tradeoff (flagged, plan §6.2/§19): a self-built IV proxy from EOD
-snapshots is less precise than live OPRA. Phase 0 quantifies proxy-vs-OPRA
-divergence; if it materially changes smoke-detector verdicts, escalate to CEO
-to reconsider D2 (OPRA is the higher-accuracy option).
+  * **Backtesting** — compute **HV (historical volatility)** as the IV proxy.
+    OPRA is too expensive; the EOD-chain self-built IV path is dropped. HV is
+    realized volatility from the daily bars we already ingest, so it costs zero
+    extra data spend.
+  * **Live/paper** — obtain IV / options data via **IBKR** (we already connect
+    to IBKR for execution). The ``IbkrIvProvider`` is the parameterized swap
+    target; it raises ``NotImplementedError`` until the IBKR market-data wiring
+    lands (P0-3), so the composition root is the only place that changes.
 
-The interface (``IvProvider`` protocol) is parameterized so the source can be
-swapped to OPRA later WITHOUT touching the sieve:
-  - ``EodChainIvProvider`` (default, D2) — computes IV from an EOD chain snapshot.
-  - ``OpraIvProvider`` (stub) — the parameterized swap target; raises
-    NotImplementedError until D2 is revisited. The sieve calls the protocol, so
-    swapping is a one-line wiring change in the composition root.
+The ``IvProvider`` protocol (unchanged shape) is the seam the sieve codes
+against, so swapping HV -> IBKR is a one-line wiring change. ``IvSnapshot``
+keeps its 30d/90d term-structure fields so downstream code (smoke detector,
+stops) does not need to branch on the source:
+
+  * ``HvIvProvider`` fills ``iv_30d``/``iv_90d`` with 30-/90-day realized vol
+    (annualized), ``term_slope`` and ``backwardation`` from those.
+  * Put-skew fields (``put_skew_30d``, ``put_skew_percentile_12m``,
+    ``extreme_put_skew``) are NOT computable from HV — they require option
+    prices. They are set to ``0.0``/``None``/``False`` here and are populated
+    by ``IbkrIvProvider`` in live mode. ``config/strategy.yaml`` keeps
+    ``put_skew_extreme_percentile`` (D7) for when the live IBKR IV provider is
+    wired; it is unused by the HV backtest path.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
-from math import erf, exp, log, sqrt
+from datetime import date, timedelta
+from math import sqrt
 from typing import Protocol
 
 import polars as pl
-from scipy.optimize import brentq
 
 __all__ = [
-    "CHAIN_COLUMNS",
-    "EXTREME_PUT_SKEW_PERCENTILE",
-    "PUT_SKEW_MONEYNESS",
-    "EodChainIvProvider",
+    "TRADING_DAYS_PER_YEAR",
+    "BarLoader",
+    "HvIvProvider",
+    "IbkrIvProvider",
     "IvProvider",
     "IvSnapshot",
-    "OpraIvProvider",
-    "OptionType",
-    "black_scholes_price",
-    "compute_iv_from_chain",
-    "implied_vol",
-    "rolling_put_skew_percentile",
+    "compute_hv",
+    "compute_hv_snapshot",
 ]
 
-# --- Chain schema (EOD options chain snapshot) --- #
-CHAIN_COLUMNS: tuple[str, ...] = (
-    "symbol",  # underlying symbol
-    "expiration",  # option expiration date (date)
-    "strike",  # strike price
-    "type",  # "C" | "P"
-    "bid",  # bid price
-    "ask",  # ask price
-)
-
-PUT_SKEW_MONEYNESS: float = 0.90  # OTM put strike = 0.90 * spot (proxy for ~25-delta put)
-EXTREME_PUT_SKEW_PERCENTILE: float = 90.0  # plan §6.2: extreme put skew >= 90th pct of 12m
+# 252 is the conventional US-equity trading-day count for annualizing realized vol.
+TRADING_DAYS_PER_YEAR: int = 252
 
 
-# --- Black-Scholes --- #
-OptionType = str  # "C" or "P"
-
-
-def _norm_cdf(x: float) -> float:
-    """Standard normal CDF (scipy.stats.norm is heavier; use erf for a single call)."""
-    return 0.5 * (1.0 + erf(x / sqrt(2.0)))
-
-
-def black_scholes_price(
-    S: float, K: float, T: float, r: float, sigma: float, option_type: OptionType, *, q: float = 0.0
-) -> float:
-    """Black-Scholes-Merton price. ``T`` in years, ``r``/``q`` continuous rates.
-
-    ``option_type`` is "C" (call) or "P" (put). Returns the option price.
-    """
-    if T <= 0 or sigma <= 0:
-        # At/after expiry or zero vol: intrinsic value.
-        if option_type == "C":
-            return max(S * (1.0 - q) - K, 0.0)
-        return max(K - S, 0.0)
-    sqrtT_sigma = sqrt(T) * sigma
-    d1 = (log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / sqrtT_sigma
-    d2 = d1 - sqrtT_sigma
-    disc_K = K * exp(-r * T)
-    spot_adj = S * exp(-q * T)
-    if option_type == "C":
-        return spot_adj * _norm_cdf(d1) - disc_K * _norm_cdf(d2)
-    if option_type == "P":
-        return disc_K * _norm_cdf(-d2) - spot_adj * _norm_cdf(-d1)
-    raise ValueError(f"option_type must be 'C' or 'P', got {option_type!r}")
-
-
-def implied_vol(
-    price: float,
-    S: float,
-    K: float,
-    T: float,
-    r: float,
-    option_type: OptionType,
-    *,
-    q: float = 0.0,
-    bracket: tuple[float, float] = (1e-4, 5.0),
-) -> float:
-    """Invert Black-Scholes to recover implied vol from a market price (scipy brentq).
-
-    Returns the implied volatility (annualized, decimal). Raises ValueError if
-    the price is outside the no-arbitrage bounds or brentq fails to bracket.
-    """
-    if price <= 0:
-        raise ValueError(f"price must be > 0, got {price}")
-    if T <= 0:
-        raise ValueError(f"T must be > 0, got {T}")
-
-    # No-arb bounds: |S*exp(-qT) - K*exp(-rT)| bounds option value.
-    intrinsic_call = max(S * (1.0 - q) - K, 0.0)
-    intrinsic_put = max(K - S, 0.0)
-    if option_type == "C":
-        lower, upper = intrinsic_call, S * (1.0 - q)
-    elif option_type == "P":
-        lower, upper = intrinsic_put, K
-    else:
-        raise ValueError(f"option_type must be 'C' or 'P', got {option_type!r}")
-    if price < lower - 1e-9 or price > upper + 1e-9:
-        raise ValueError(
-            f"price {price} outside no-arb bounds [{lower}, {upper}] for "
-            f"{option_type} S={S} K={K} T={T} r={r}"
-        )
-
-    def objective(sigma: float) -> float:
-        return black_scholes_price(S, K, T, r, sigma, option_type, q=q) - price
-
-    # Ensure the bracket straddles zero.
-    lo, hi = bracket
-    f_lo, f_hi = objective(lo), objective(hi)
-    if f_lo * f_hi > 0:
-        raise ValueError(
-            f"implied_vol: brentq bracket [{lo}, {hi}] does not straddle zero "
-            f"(f(lo)={f_lo}, f(hi)={f_hi}) for price={price}"
-        )
-    return float(brentq(objective, lo, hi, xtol=1e-8, rtol=1e-8, maxiter=200))
-
-
-# --- IV snapshot --- #
+# --- IV snapshot (shape unchanged from D2; put-skew fields deferred to IBKR) --- #
 @dataclass(frozen=True, slots=True)
 class IvSnapshot:
-    """Per-symbol daily IV snapshot (plan §6.2) — persisted to Object Storage + NoSQL."""
+    """Per-symbol daily IV snapshot (plan §6.2).
+
+    For the HV backtest proxy: ``iv_30d``/``iv_90d`` are 30-/90-day realized
+    vol (annualized decimal); put-skew fields are zeroed (not computable from
+    bars). For the live IBKR provider: all fields populated from IBKR option
+    data. Downstream code reads the snapshot uniformly.
+    """
 
     symbol: str
     as_of: date
-    iv_30d: float  # 30-day ATM IV (decimal, annualized)
-    iv_90d: float  # 90-day ATM IV (decimal, annualized)
+    iv_30d: float  # 30-day IV (HV proxy in backtest; ATM IV in live)
+    iv_90d: float  # 90-day IV (HV proxy in backtest; ATM IV in live)
     term_slope: float  # iv_30d - iv_90d  (>0 => backwardation, plan §6.2)
-    put_skew_30d: float  # 30D OTM-put IV - 30D ATM IV (proxy for 25-delta skew)
-    put_skew_percentile_12m: float | None  # pct of 30D put skew vs trailing 12m (0-100)
+    put_skew_30d: float  # 30D OTM-put IV - 30D ATM IV (0.0 under HV proxy; live via IBKR)
+    put_skew_percentile_12m: (
+        float | None
+    )  # pct vs trailing 12m (None under HV proxy; live via IBKR)
     backwardation: bool  # iv_30d > iv_90d  (plan §6.2 smoke-detector trigger)
-    extreme_put_skew: bool  # put_skew_percentile_12m >= 90 (plan §6.2 smoke-detector trigger)
+    extreme_put_skew: bool  # False under HV proxy; live via IBKR
 
 
-def _nearest_expiry(chain: pl.DataFrame, target_days: float, as_of: date) -> date | None:
-    """Pick the expiration nearest to ``target_days`` from ``as_of``."""
-    avail = chain["expiration"].unique().sort()
-    dates = [d for d in avail.to_list() if isinstance(d, date)]
-    if not dates:
-        return None
-    return min(dates, key=lambda d: abs((d - as_of).days - target_days))
-
-
-def _nearest_strike(
-    strikes: list[float], target: float, *, prefer_le: bool = False
-) -> float | None:
-    """Pick the strike nearest to ``target``. If ``prefer_le``, prefer strikes <= target."""
-    if not strikes:
-        return None
-    if prefer_le:
-        below = [s for s in strikes if s <= target]
-        pool = below if below else strikes
-    else:
-        pool = strikes
-    return min(pool, key=lambda s: abs(s - target))
-
-
-def _atm_iv(
-    chain: pl.DataFrame, expiry: date | None, spot: float, r: float, as_of: date
-) -> float | None:
-    """ATM IV at ``expiry`` — average of the nearest-strike call IV and put IV."""
-    if expiry is None:
-        return None
-    sub = chain.filter(pl.col("expiration") == expiry)
-    if sub.is_empty():
-        return None
-    atm_strike = _nearest_strike(sub["strike"].unique().to_list(), spot)
-    if atm_strike is None:
-        return None
-    T = max((expiry - as_of).days, 1) / 365.0
-    mid = sub.filter(pl.col("strike") == atm_strike).with_columns(
-        ((pl.col("bid") + pl.col("ask")) / 2.0).alias("mid")
-    )
-    ivs: list[float] = []
-    for row in mid.filter(pl.col("mid") > 0).iter_rows(named=True):
-        try:
-            ivs.append(implied_vol(row["mid"], spot, atm_strike, T, r, row["type"]))
-        except ValueError:
-            continue
-    if not ivs:
-        return None
-    return sum(ivs) / len(ivs)
-
-
-def _otm_put_iv(
-    chain: pl.DataFrame, expiry: date | None, spot: float, r: float, as_of: date, moneyness: float
-) -> float | None:
-    """IV of the OTM put nearest to ``moneyness * spot`` (PUT_SKEW_MONEYNESS=0.90)."""
-    if expiry is None:
-        return None
-    target_strike = moneyness * spot
-    puts = chain.filter((pl.col("expiration") == expiry) & (pl.col("type") == "P"))
-    if puts.is_empty():
-        return None
-    atm_strike = _nearest_strike(puts["strike"].unique().to_list(), target_strike, prefer_le=True)
-    if atm_strike is None:
-        return None
-    T = max((expiry - as_of).days, 1) / 365.0
-    row = (
-        puts.filter(pl.col("strike") == atm_strike)
-        .with_columns(((pl.col("bid") + pl.col("ask")) / 2.0).alias("mid"))
-        .filter(pl.col("mid") > 0)
-    )
-    if row.is_empty():
-        return None
-    r0 = row.row(0, named=True)
-    try:
-        return implied_vol(r0["mid"], spot, atm_strike, T, r, "P")
-    except ValueError:
-        return None
-
-
-def compute_iv_from_chain(
-    chain: pl.DataFrame,
-    spot: float,
-    r: float,
-    as_of: date,
-    symbol: str,
+# --- HV (realized volatility) --- #
+def compute_hv(
+    closes: pl.Series | list[float] | pl.DataFrame,
+    window: int,
     *,
-    put_skew_moneyness: float = PUT_SKEW_MONEYNESS,
-) -> IvSnapshot:
-    """Compute an IV snapshot from an EOD options chain snapshot (plan §6.2, D2).
+    trading_days: int = TRADING_DAYS_PER_YEAR,
+) -> float | None:
+    """Realized volatility over a trailing ``window`` of daily closes (annualized).
 
-    ``chain`` conforms to CHAIN_COLUMNS. ``spot`` is the underlying close on
-    ``as_of``. ``r`` is the risk-free continuous rate (from data/rates.py).
-    Returns the raw snapshot (12m percentile is None here; the provider fills it
-    from history via rolling_put_skew_percentile).
+    HV = sample-std of the trailing ``window`` log returns, annualized by
+    ``sqrt(trading_days)``. Requires at least ``window + 1`` closes to yield
+    ``window`` returns; returns ``None`` if there is not enough history (the
+    provider surfaces this as a snapshot-time error, not here).
+
+    Accepts a polars Series, a list of floats, or a 1-column DataFrame of
+    closes sorted ascending by date (caller responsibility).
     """
-    if spot <= 0:
-        raise ValueError(f"spot must be > 0, got {spot}")
-    my_chain = chain.filter(pl.col("symbol") == symbol)
-    if my_chain.is_empty():
-        raise ValueError(f"no options in chain for {symbol!r}")
+    if window <= 0:
+        raise ValueError(f"window must be > 0, got {window}")
+    if isinstance(closes, pl.DataFrame):
+        if closes.width != 1:
+            raise ValueError("compute_hv: pass a 1-column DataFrame, a Series, or a list")
+        closes = closes.to_series()
+    series = pl.Series("c", closes) if not isinstance(closes, pl.Series) else closes
+    series = series.cast(pl.Float64).drop_nulls()
+    if series.len() < window + 1:
+        return None
+    # Trailing `window` log returns need the last `window + 1` closes.
+    tail = series.tail(window + 1)
+    log_rets = (tail / tail.shift(1)).log()
+    log_rets = log_rets.drop_nulls()
+    if log_rets.len() < 2:
+        return None
+    std_val = log_rets.std(ddof=1)
+    if std_val is None:
+        return None
+    # polars' std() stubs widen the scalar to `float | timedelta | None`; a
+    # timedelta is impossible for log-returns but the guard satisfies the type
+    # checker and defends against an unexpected dtype.
+    if isinstance(std_val, timedelta):
+        return None
+    return float(std_val) * sqrt(trading_days)
 
-    exp_30 = _nearest_expiry(my_chain, 30.0, as_of)
-    exp_90 = _nearest_expiry(my_chain, 90.0, as_of)
 
-    iv_30d = _atm_iv(my_chain, exp_30, spot, r, as_of)
-    iv_90d = _atm_iv(my_chain, exp_90, spot, r, as_of)
-    if iv_30d is None or iv_90d is None:
+def compute_hv_snapshot(
+    bars: pl.DataFrame,
+    symbol: str,
+    as_of: date,
+    *,
+    hv_short: int = 30,
+    hv_long: int = 90,
+    trading_days: int = TRADING_DAYS_PER_YEAR,
+) -> IvSnapshot:
+    """Build an ``IvSnapshot`` from a bar frame using HV as the IV proxy.
+
+    ``bars`` must conform to ``BAR_SCHEMA`` (symbol, ts, open, high, low, close,
+    volume) and span at least ``hv_long + 1`` daily closes ending at/ before
+    ``as_of``. Short/long HV fill ``iv_30d``/``iv_90d``; put-skew fields are
+    zeroed (not computable from bars — deferred to the live IBKR provider).
+    Raises ``ValueError`` if there is not enough history for either window.
+    """
+    if hv_short <= 0 or hv_long <= 0 or hv_short >= hv_long:
+        raise ValueError(f"require 0 < hv_short < hv_long, got {hv_short}, {hv_long}")
+    if bars.is_empty():
+        raise ValueError(f"no bars for {symbol!r} to compute HV as of {as_of}")
+    sub = bars.filter(pl.col("symbol") == symbol).filter(pl.col("ts").dt.date() <= as_of).sort("ts")
+    if sub.is_empty():
+        raise ValueError(f"no bars for {symbol!r} on/before {as_of}")
+    closes = sub["close"].cast(pl.Float64)
+    hv_30d = compute_hv(closes, hv_short, trading_days=trading_days)
+    hv_90d = compute_hv(closes, hv_long, trading_days=trading_days)
+    if hv_30d is None or hv_90d is None:
         raise ValueError(
-            f"could not compute ATM IV for {symbol} on {as_of} (iv_30d={iv_30d}, iv_90d={iv_90d})"
+            f"insufficient history for {symbol!r} as of {as_of}: need >={hv_long + 1} "
+            f"closes, got {closes.len()} (hv_30d={hv_30d}, hv_90d={hv_90d})"
         )
-
-    atm_30 = iv_30d
-    otm_put_30 = _otm_put_iv(my_chain, exp_30, spot, r, as_of, put_skew_moneyness)
-    put_skew_30d = (otm_put_30 - atm_30) if otm_put_30 is not None else 0.0
-
-    term_slope = iv_30d - iv_90d
+    term_slope = hv_30d - hv_90d
     return IvSnapshot(
         symbol=symbol,
         as_of=as_of,
-        iv_30d=iv_30d,
-        iv_90d=iv_90d,
+        iv_30d=hv_30d,
+        iv_90d=hv_90d,
         term_slope=term_slope,
-        put_skew_30d=put_skew_30d,
-        put_skew_percentile_12m=None,  # filled by the provider from history
+        put_skew_30d=0.0,
+        put_skew_percentile_12m=None,
         backwardation=term_slope > 0.0,
-        extreme_put_skew=False,  # filled by the provider from history
+        extreme_put_skew=False,
     )
 
 
-def rolling_put_skew_percentile(
-    history_put_skew: list[float],
-    current_put_skew: float,
-    *,
-    window: int = 252,  # ~12 months of trading days
-) -> float:
-    """Percentile (0-100) of current 30D put skew vs trailing 12m window (plan §6.2)."""
-    if not history_put_skew:
-        return 50.0  # no history => neutral (not extreme)
-    windowed = history_put_skew[-window:] if len(history_put_skew) > window else history_put_skew
-    n = len(windowed)
-    rank = sum(1 for v in windowed if v <= current_put_skew)
-    return 100.0 * rank / n
-
-
-# --- Provider protocol (D2 parameterization for later OPRA swap) --- #
+# --- Provider protocol (parameterized swap: HV backtest -> IBKR live) --- #
 class IvProvider(Protocol):
-    """IV source protocol (plan §6.2). The sieve calls this, never the chain directly.
+    """IV source protocol (plan §6.2). The sieve calls this, never bars/IBKR directly.
 
-    Swapping EOD-chain-IV -> OPRA is a one-line wiring change in the composition
-    root; the sieve is untouched (D2 parameterization).
+    Swapping HV (backtest) -> IBKR (live) is a one-line wiring change in the
+    composition root; the sieve is untouched (D2 parameterization preserved).
     """
 
     def get_snapshot(self, symbol: str, as_of: date) -> IvSnapshot: ...
 
 
-class EodChainIvProvider:
-    """Default IV provider: self-built IV from an EOD chain snapshot (plan §6.2, D2).
+class BarLoader(Protocol):
+    """Loads the daily bars for a symbol up to ``as_of`` for the HV provider.
 
-    The chain source is injected (``chain_loader``) so this provider is testable
-    with a synthetic chain and swappable to databento EOD options in production.
-    History of put-skew values is injected for the 12m percentile.
+    Returns a ``BAR_SCHEMA`` frame sorted ascending by ts; the provider trims to
+    the lookback it needs. Injected so the provider is testable with synthetic
+    bars and swappable to ``BarRepo`` / ``BarStore`` in production.
+    """
+
+    def __call__(self, symbol: str, as_of: date) -> pl.DataFrame: ...
+
+
+class HvIvProvider:
+    """Backtest IV provider: HV (realized vol) from daily bars (CEO 2026-07-18).
+
+    Default for backtesting. ``bar_loader`` injects the bar source
+    (``BarRepo``/``BarStore`` in prod; a synthetic fixture in tests).
+    ``hv_short``/``hv_long`` set the two realized-vol windows (30/90 days by
+    default). Put-skew smoke-detector fields are zeroed — they require option
+    data and are populated only by the live ``IbkrIvProvider``.
     """
 
     def __init__(
         self,
-        chain_loader: ChainLoader,
-        spot_loader: SpotLoader,
-        risk_free_rate: float,
-        put_skew_history: dict[str, list[float]] | None = None,
+        bar_loader: BarLoader,
+        *,
+        hv_short: int = 30,
+        hv_long: int = 90,
+        trading_days: int = TRADING_DAYS_PER_YEAR,
     ) -> None:
-        self.chain_loader = chain_loader
-        self.spot_loader = spot_loader
-        self.r = risk_free_rate
-        self.put_skew_history = put_skew_history or {}
+        self.bar_loader = bar_loader
+        self.hv_short = hv_short
+        self.hv_long = hv_long
+        self.trading_days = trading_days
 
     def get_snapshot(self, symbol: str, as_of: date) -> IvSnapshot:
-        chain = self.chain_loader(symbol, as_of)
-        spot = self.spot_loader(symbol, as_of)
-        snap = compute_iv_from_chain(chain, spot, self.r, as_of, symbol)
-        hist = self.put_skew_history.get(symbol, [])
-        if hist:
-            pct = rolling_put_skew_percentile(hist, snap.put_skew_30d)
-            return IvSnapshot(
-                symbol=snap.symbol,
-                as_of=snap.as_of,
-                iv_30d=snap.iv_30d,
-                iv_90d=snap.iv_90d,
-                term_slope=snap.term_slope,
-                put_skew_30d=snap.put_skew_30d,
-                put_skew_percentile_12m=pct,
-                backwardation=snap.backwardation,
-                extreme_put_skew=pct >= EXTREME_PUT_SKEW_PERCENTILE,
-            )
-        return snap
+        bars = self.bar_loader(symbol, as_of)
+        return compute_hv_snapshot(
+            bars,
+            symbol,
+            as_of,
+            hv_short=self.hv_short,
+            hv_long=self.hv_long,
+            trading_days=self.trading_days,
+        )
 
 
-class OpraIvProvider:
-    """Parameterized OPRA swap target (plan §6.2, D2). NOT wired in v1.
+class IbkrIvProvider:
+    """Live/paper IV provider via IBKR (CEO 2026-07-18). NOT wired in P0-1.
 
-    Raises NotImplementedError until D2 is revisited (Phase 0 validation of
-    EOD-chain-IV-vs-OPRA divergence). The sieve codes against ``IvProvider``, so
-    enabling OPRA is a one-line composition-root change.
+    Parameterized swap target for live trading: obtains IV / options data via
+    IBKR (contract details / option chain) and fills the full ``IvSnapshot``
+    including put-skew smoke-detector fields. Raises ``NotImplementedError``
+    until the IBKR market-data wiring lands (P0-3); the sieve codes against
+    ``IvProvider``, so enabling IBKR IV is a one-line composition-root change.
     """
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         raise NotImplementedError(
-            "OpraIvProvider is the D2 parameterized swap target, not wired in v1. "
-            "Phase 0 quantifies EOD-chain-IV-vs-OPRA divergence; if it materially "
-            "changes smoke-detector verdicts, escalate to CEO to reconsider D2."
+            "IbkrIvProvider is the live/paper IV source via IBKR (CEO directive "
+            "2026-07-18), not wired until the IBKR market-data integration lands "
+            "(P0-3). For backtesting use HvIvProvider (HV proxy)."
         )
 
     def get_snapshot(self, symbol: str, as_of: date) -> IvSnapshot:  # pragma: no cover
         raise NotImplementedError
-
-
-# --- Loader protocol types (for type-checking the provider composition) --- #
-class ChainLoader(Protocol):
-    def __call__(self, symbol: str, as_of: date) -> pl.DataFrame: ...
-
-
-class SpotLoader(Protocol):
-    def __call__(self, symbol: str, as_of: date) -> float: ...

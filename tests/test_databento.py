@@ -1,4 +1,4 @@
-"""Tests for data/databento.py — pure normalizer (live calls are @pytest.mark.integration)."""
+"""Tests for data/databento.py — pure normalizer + BarFetcher surface (live calls @integration)."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ import pytest
 from personal_strat_pai.data.databento import (
     DatabentoClient,
     normalize_bars,
-    normalize_option_chain,
 )
 from personal_strat_pai.data.polars_utils import BAR_SCHEMA
 
@@ -71,6 +70,13 @@ def test_databento_client_requires_key():
             os.environ["DATABENTO_API_KEY"] = old
 
 
-def test_normalize_option_chain_empty_returns_empty():
-    out = normalize_option_chain(pl.DataFrame())
-    assert out.is_empty()
+def test_databento_client_exposes_bar_fetcher_surface():
+    # DatabentoClient implements the BarFetcher protocol (data/repo.py) via fetch_bars.
+    # The method is integration-gated (live databento), but its signature/dispatch
+    # is asserted here so the caching repo can compose it without a live call.
+    client = DatabentoClient(api_key="dummy-key")
+    assert hasattr(client, "fetch_bars")
+    assert callable(client.fetch_bars)
+    # No EOD option-chain surface remains after the CEO 2026-07-18 IV change.
+    assert not hasattr(client, "get_eod_option_chain")
+    assert not hasattr(client, "normalize_option_chain")

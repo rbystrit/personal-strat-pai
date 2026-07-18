@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -108,3 +108,131 @@ def test_sqlite_cache_missing_symbol_returns_empty(tmp_path: Path):
     out = cache.get_recent("NOPE", n_days=5)
     assert out.is_empty()
     assert cache.get_recent_close("NOPE") is None
+
+
+# --- upsert_bars + coverage (CEO 2026-07-18: no double download) --- #
+
+
+def _bars_range(symbols: list[str], start: datetime, days: int) -> pl.DataFrame:
+    rows = []
+    for sym in symbols:
+        for i in range(days):
+            ts = start + timedelta(days=i)
+            rows.append(
+                {
+                    "symbol": sym,
+                    "ts": ts,
+                    "open": 100.0 + i,
+                    "high": 101.0 + i,
+                    "low": 99.0 + i,
+                    "close": 100.5 + i,
+                    "volume": 1_000_000 + i,
+                }
+            )
+    return pl.DataFrame(rows, schema=BAR_SCHEMA)
+
+
+def test_coverage_empty_store_returns_empty(tmp_path: Path):
+    store = BarStore(tmp_path / "empty")
+    assert store.coverage(kind="daily") == {}
+
+
+def test_coverage_returns_per_symbol_first_last(tmp_bars_dir: Path):
+    store = BarStore(tmp_bars_dir)
+    df = _bars_range(["XLB", "XLY"], datetime(2024, 1, 2, tzinfo=UTC), days=5)
+    store.write_bars(df, kind="daily")
+    cov = store.coverage(kind="daily")
+    assert set(cov.keys()) == {"XLB", "XLY"}
+    first, last = cov["XLB"]
+    assert first.date() == date(2024, 1, 2)
+    assert last.date() == date(2024, 1, 6)
+
+
+def test_coverage_filters_to_requested_symbols(tmp_bars_dir: Path):
+    store = BarStore(tmp_bars_dir)
+    store.write_bars(
+        _bars_range(["XLB", "XLY", "TLT"], datetime(2024, 1, 2, tzinfo=UTC), days=3), kind="daily"
+    )
+    cov = store.coverage(kind="daily", symbols=["XLY"])
+    assert set(cov.keys()) == {"XLY"}
+
+
+def test_upsert_bars_idempotent_re_write_no_duplicates(tmp_bars_dir: Path):
+    store = BarStore(tmp_bars_dir)
+    df = _bars_range(["XLB"], datetime(2024, 1, 2, tzinfo=UTC), days=3)
+    store.upsert_bars(df, kind="daily")
+    # Upsert the SAME frame again -> no duplicate (symbol, ts) rows.
+    store.upsert_bars(df, kind="daily")
+    out = store.read_bars_eager(kind="daily", symbols=["XLB"]).sort("ts")
+    assert out.height == 3
+    per_day = out.group_by("ts").len().sort("len", descending=True)
+    assert per_day["len"].max() == 1
+
+
+def test_upsert_bars_merges_forward_extension(tmp_bars_dir: Path):
+    store = BarStore(tmp_bars_dir)
+    base = _bars_range(["XLB"], datetime(2024, 1, 2, tzinfo=UTC), days=3)
+    store.upsert_bars(base, kind="daily")
+    # Extend forward: days 3..6 (overlapping at the boundary not required by upsert).
+    ext = _bars_range(["XLB"], datetime(2024, 1, 5, tzinfo=UTC), days=4)
+    store.upsert_bars(ext, kind="daily")
+    out = store.read_bars_eager(kind="daily", symbols=["XLB"]).sort("ts")
+    # 7 distinct days (Jan 2..8); no duplicates.
+    assert out.height == 7
+    assert out["ts"].is_unique().all()
+    cov = store.coverage(kind="daily", symbols=["XLB"])["XLB"]
+    assert cov[0].date() == date(2024, 1, 2)
+    assert cov[1].date() == date(2024, 1, 8)
+
+
+def test_upsert_bars_overwrites_overlapping_rows_keep_latest(tmp_bars_dir: Path):
+    store = BarStore(tmp_bars_dir)
+    base = _bars_range(["XLB"], datetime(2024, 1, 2, tzinfo=UTC), days=3)
+    store.upsert_bars(base, kind="daily")
+    # Re-fetch the same days with different close values -> keep-latest wins.
+    new_rows = pl.DataFrame(
+        [
+            {
+                "symbol": "XLB",
+                "ts": datetime(2024, 1, 2, tzinfo=UTC),
+                "open": 200.0,
+                "high": 201.0,
+                "low": 199.0,
+                "close": 200.5,
+                "volume": 999,
+            },
+            {
+                "symbol": "XLB",
+                "ts": datetime(2024, 1, 3, tzinfo=UTC),
+                "open": 300.0,
+                "high": 301.0,
+                "low": 299.0,
+                "close": 300.5,
+                "volume": 888,
+            },
+        ],
+        schema=BAR_SCHEMA,
+    )
+    store.upsert_bars(new_rows, kind="daily")
+    out = store.read_bars_eager(kind="daily", symbols=["XLB"]).sort("ts")
+    assert out.height == 3
+    jan2 = out.filter(pl.col("ts") == datetime(2024, 1, 2, tzinfo=UTC))
+    assert jan2["close"].to_list() == [200.5]  # overwritten, not the original 100.5
+    jan4 = out.filter(pl.col("ts") == datetime(2024, 1, 4, tzinfo=UTC))
+    assert jan4["close"].to_list() == [102.5]  # untouched original
+
+
+def test_upsert_bars_handles_multiple_symbols(tmp_bars_dir: Path):
+    store = BarStore(tmp_bars_dir)
+    df = _bars_range(["XLB", "XLY", "TLT"], datetime(2024, 1, 2, tzinfo=UTC), days=4)
+    counts = store.upsert_bars(df, kind="daily")
+    assert counts == {"XLB": 4, "XLY": 4, "TLT": 4}
+    cov = store.coverage(kind="daily")
+    assert set(cov.keys()) == {"XLB", "XLY", "TLT"}
+
+
+def test_upsert_bars_rejects_lazyframe(tmp_bars_dir: Path):
+    store = BarStore(tmp_bars_dir)
+    df = _bars_range(["XLB"], datetime(2024, 1, 2, tzinfo=UTC), days=3)
+    with pytest.raises(Exception, match="LazyFrame"):
+        store.upsert_bars(df.lazy(), kind="daily")
