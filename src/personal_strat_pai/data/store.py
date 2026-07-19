@@ -37,6 +37,8 @@ import polars as pl
 from personal_strat_pai.data.polars_utils import (
     BAR_COLUMNS,
     BAR_SCHEMA,
+    RATE_OBSERVATION_COLUMNS,
+    RATE_OBSERVATION_SCHEMA,
     assert_eager,
     collect_eager,
     to_utc_datetime,
@@ -47,6 +49,7 @@ __all__ = [
     "BarStore",
     "Coverage",
     "OciBackendNotConfigured",
+    "RateSeriesStore",
     "SQLiteCache",
 ]
 
@@ -261,6 +264,185 @@ class BarStore:
             if df.schema[col] != dtype and not _dtype_compatible(df.schema[col], dtype):
                 raise ValueError(
                     f"bar schema column {col!r}: expected {dtype}, got {df.schema[col]}"
+                )
+
+
+class RateSeriesStore:
+    """Parquet-backed rate-observation store (plan §6.3, FRED/databento).
+
+    Mirrors ``BarStore`` for rate observations (SOFR / OIS / real rates). Same
+    no-double-download primitives (CEO 2026-07-18 / 2026-07-19):
+
+      * ``write_observations`` — eager write at ingest, partitioned by ``series``
+        (hive-style) so reads get series-level partition pruning.
+      * ``scan_observations`` — lazy ``scan_parquet`` with optional
+        series/date predicate pushdown. The caller MUST ``collect_eager()`` at
+        a strategy boundary (D14(b)).
+      * ``upsert_observations`` — idempotent merge by ``(series, ts)`` keep-latest,
+        so overlapping re-fetches never duplicate rows.
+      * ``coverage`` — per-series ``(first_ts, last_ts)`` to drive the caching
+        repo's missing-range math.
+
+    Backing store: ``file://`` is fully exercised in CI; ``oci://`` lands in
+    P0-2 (creds) — only ``base_uri`` changes.
+    """
+
+    def __init__(self, base_uri: str | Path = "data/local/rates") -> None:
+        self.base_uri = base_uri
+        self._base = _resolve_base(base_uri)
+
+    def write_observations(
+        self,
+        df: pl.DataFrame,
+        *,
+        compression: Literal["zstd", "snappy", "gzip"] = "zstd",
+    ) -> list[str]:
+        """Eager write at ingest (plan §6.1: write_parquet eager at ingest).
+
+        Partitions by ``series`` (hive-style) so reads get series partition
+        pruning. Validates the rate-observation schema first; rejects
+        LazyFrame input.
+        """
+        assert_eager(df, "RateSeriesStore.write_observations")
+        self._validate_rate_schema(df)
+        target = self._base
+        target.mkdir(parents=True, exist_ok=True)
+        df.write_parquet(target, partition_by=["series"], compression=compression)
+        return sorted(str(p) for p in target.rglob("*.parquet"))
+
+    def scan_observations(
+        self,
+        *,
+        series: list[str] | None = None,
+        start: str | datetime | date | None = None,
+        end: str | datetime | date | None = None,
+    ) -> pl.LazyFrame:
+        """Lazy scan over partitioned parquet with predicate pushdown (D14(a)).
+
+        Returns a LazyFrame. The caller MUST ``collect_eager()`` at a strategy
+        boundary. ``start`` inclusive, ``end`` exclusive.
+        """
+        if not self._has_parquet():
+            return pl.DataFrame(schema=RATE_OBSERVATION_SCHEMA).lazy()
+        lf = pl.scan_parquet(self._base, hive_partitioning=True)
+        predicates: list[pl.Expr] = []
+        if series is not None:
+            predicates.append(pl.col("series").is_in(series))
+        start_dt = to_utc_datetime(start)
+        end_dt = to_utc_datetime(end)
+        if start_dt is not None:
+            predicates.append(pl.col("ts") >= pl.lit(start_dt))
+        if end_dt is not None:
+            predicates.append(pl.col("ts") < pl.lit(end_dt))
+        if predicates:
+            lf = lf.filter(pl.all_horizontal(predicates))
+        return lf.select(list(RATE_OBSERVATION_COLUMNS))
+
+    def read_observations_eager(
+        self,
+        *,
+        series: list[str] | None = None,
+        start: str | datetime | date | None = None,
+        end: str | datetime | date | None = None,
+    ) -> pl.DataFrame:
+        """Eager read — collect at the boundary. Use for small slices / curve builds."""
+        return collect_eager(self.scan_observations(series=series, start=start, end=end))
+
+    def upsert_observations(
+        self,
+        df: pl.DataFrame,
+        *,
+        compression: Literal["zstd", "snappy", "gzip"] = "zstd",
+    ) -> dict[str, int]:
+        """Idempotent upsert — merge ``df`` into existing partitions by ``(series, ts)``.
+
+        CEO directive 2026-07-19 (FRED follows the same no-double-download
+        policy as bars): the caching repo fetches only the missing range and
+        calls ``upsert_observations`` so re-fetching an overlapping range is a
+        no-op (keep-latest on ``(series, ts)``), never a duplicate. Per-series:
+        read the existing partition, concat with the new rows, unique by
+        ``(series, ts)`` keeping the new (latest) rows, sort by ts, then rewrite
+        the partition. Returns ``{series: rows_in_partition_after}``.
+        """
+        assert_eager(df, "RateSeriesStore.upsert_observations")
+        self._validate_rate_schema(df)
+        target = self._base
+        target.mkdir(parents=True, exist_ok=True)
+        result: dict[str, int] = {}
+        for sid in df["series"].unique().sort().to_list():
+            new_rows = df.filter(pl.col("series") == sid)
+            existing = self._read_rate_partition(sid)
+            if existing.is_empty() and new_rows.is_empty():
+                result[sid] = 0
+                continue
+            merged = (
+                pl.concat([existing, new_rows], how="vertical_relaxed")
+                .unique(subset=["series", "ts"], keep="last")
+                .sort(["ts"])
+            )
+            self._rewrite_rate_partition(target, sid, merged, compression=compression)
+            result[sid] = merged.height
+        return result
+
+    def coverage(self, *, series: list[str] | None = None) -> dict[str, Coverage]:
+        """Per-series ``(first_ts, last_ts)`` from the store (CEO no-double-download).
+
+        Eager, small aggregation — drives the caching repo's missing-range
+        computation. Returns ``{}`` for an empty store. Datetimes are tz-aware UTC.
+        """
+        if not self._has_parquet():
+            return {}
+        lf = pl.scan_parquet(self._base, hive_partitioning=True)
+        if series is not None:
+            lf = lf.filter(pl.col("series").is_in(series))
+        agg = (
+            lf.group_by("series")
+            .agg(
+                pl.col("ts").min().alias("first_ts"),
+                pl.col("ts").max().alias("last_ts"),
+            )
+            .collect()
+        )
+        out: dict[str, Coverage] = {}
+        for row in agg.iter_rows(named=True):
+            out[row["series"]] = (row["first_ts"], row["last_ts"])
+        return out
+
+    def _has_parquet(self) -> bool:
+        """True if the store base has at least one parquet file (cheap rglob)."""
+        return self._base.exists() and any(self._base.rglob("*.parquet"))
+
+    def _read_rate_partition(self, series: str) -> pl.DataFrame:
+        """Read a single series' partition eagerly (empty schema if missing)."""
+        part_dir = self._base / f"series={series}"
+        if not self._base.exists() or not part_dir.exists() or not any(part_dir.rglob("*.parquet")):
+            return pl.DataFrame(schema=RATE_OBSERVATION_SCHEMA)
+        return collect_eager(
+            pl.scan_parquet(self._base, hive_partitioning=True).filter(pl.col("series") == series)
+        ).select(list(RATE_OBSERVATION_COLUMNS))
+
+    @staticmethod
+    def _rewrite_rate_partition(
+        base: Path,
+        series: str,
+        merged: pl.DataFrame,
+        *,
+        compression: Literal["zstd", "snappy", "gzip"],
+    ) -> None:
+        """Rewrite a single series' partition in the canonical hive layout."""
+        part_dir = base / f"series={series}"
+        if part_dir.exists():
+            shutil.rmtree(part_dir)
+        merged.write_parquet(base, partition_by=["series"], compression=compression)
+
+    @staticmethod
+    def _validate_rate_schema(df: pl.DataFrame) -> None:
+        for col, dtype in RATE_OBSERVATION_SCHEMA.items():
+            if col not in df.columns:
+                raise ValueError(f"rate schema missing column: {col!r}")
+            if df.schema[col] != dtype and not _dtype_compatible(df.schema[col], dtype):
+                raise ValueError(
+                    f"rate schema column {col!r}: expected {dtype}, got {df.schema[col]}"
                 )
 
 

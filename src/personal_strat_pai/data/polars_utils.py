@@ -30,6 +30,8 @@ import polars as pl
 __all__ = [
     "BAR_COLUMNS",
     "BAR_SCHEMA",
+    "RATE_OBSERVATION_COLUMNS",
+    "RATE_OBSERVATION_SCHEMA",
     "CollectError",
     "EagerFrame",
     "Frame",
@@ -65,6 +67,23 @@ BAR_SCHEMA: pl.Schema = pl.Schema(
     ]
 )
 BAR_COLUMNS: tuple[str, ...] = tuple(BAR_SCHEMA.names())
+
+
+# --- Canonical rate-observation schema (plan §6.3, FRED / databento) --- #
+# One row per (series, ts) observation. `series` is the FRED series id (SOFR,
+# DGS10, DFII10, ...) or the databento instrument id. `rate` is the continuous
+# annualized rate as a DECIMAL (0.045 = 4.5%); FRED publishes percent, the
+# normalizer converts at the boundary. `source` is "FRED" / "databento" so the
+# origin is auditable after the merge.
+RATE_OBSERVATION_SCHEMA: pl.Schema = pl.Schema(
+    [
+        ("series", pl.String),
+        ("ts", pl.Datetime("us", "UTC")),
+        ("rate", pl.Float64),
+        ("source", pl.String),
+    ]
+)
+RATE_OBSERVATION_COLUMNS: tuple[str, ...] = tuple(RATE_OBSERVATION_SCHEMA.names())
 
 
 class CollectError(TypeError):

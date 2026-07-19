@@ -6,6 +6,10 @@ P0-1 surface:
   data-ingest   — databento -> parquet store via the caching BarRepo
                   (no piece of data downloaded twice; CEO directive 2026-07-18).
                   Integration-gated; needs DATABENTO_API_KEY.
+  rates-ingest  — FRED -> parquet rate-observation store via the caching
+                  FredRateRepo (same no-double-download policy; CEO directive
+                  2026-07-19). Pulls SOFR + Treasury CMT (OIS proxy) + TIPS
+                  (real rates). Integration-gated; needs FRED_API_KEY.
 
 Later phases add: run-backtest, sec-audit, reconcile, arm-backup, lease-show
 (plan §4 cli.py). Kept minimal here so P0-1 ships a working entrypoint.
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import date
 from pathlib import Path
 
 from personal_strat_pai.config import load_risk_limits, load_strategy, load_universe
@@ -93,6 +98,50 @@ def _cmd_data_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_rates_ingest(args: argparse.Namespace) -> int:
+    from personal_strat_pai.data.fred import ALL_FRED_SERIES_IDS, FredClient
+    from personal_strat_pai.data.rates import FredRateRepo
+    from personal_strat_pai.data.store import RateSeriesStore
+
+    bootstrap = _parse_date_arg(args.bootstrap_start)
+    end = _parse_date_arg(args.end)
+    client = FredClient()
+    store = RateSeriesStore(args.base_uri)
+    repo = FredRateRepo(store, client, bootstrap_start=bootstrap)
+    series_ids = ALL_FRED_SERIES_IDS if args.series is None else args.series
+    print(
+        f"ingesting {len(series_ids)} FRED series -> {args.base_uri} "
+        f"(no-double-download; bootstrap_start={bootstrap}, end={end})"
+    )
+    # get_observations fetches only the missing ranges, upserts into the store,
+    # and returns a lazy scan of the requested range. Collect eagerly for the
+    # summary (boundary -> eager, D14(b)). The FRED API key is checked lazily
+    # on the first fetch — catch RuntimeError for a clean no-creds exit.
+    try:
+        lazy = repo.get_observations(series_ids, start=args.start, end=end)
+        df = lazy.collect()
+    except RuntimeError as exc:
+        print(f"FRED fetch failed: {exc}")
+        return 3
+    cov = repo.coverage(series=series_ids)
+    if df.is_empty() and not cov:
+        print(f"no observations fetched for {args.start}..{end}; check FRED_API_KEY/range")
+        return 3
+    by_series = df.group_by("series").len().sort("series") if not df.is_empty() else None
+    print(f"OK: {df.height} observations in [{args.start}, {end}); {len(cov)} series cached.")
+    if by_series is not None:
+        for row in by_series.iter_rows(named=True):
+            print(f"  {row['series']:<10} {row['len']} rows")
+    return 0
+
+
+def _parse_date_arg(s: str) -> date:
+    """Parse an ISO-8601 date string from a CLI arg."""
+    from datetime import datetime as _dt
+
+    return _dt.fromisoformat(s).date()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="personal-strat-pai", description="Flat Momentum Strategy CLI."
@@ -123,6 +172,35 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ingest.add_argument("--config-dir", default=None)
     p_ingest.set_defaults(func=_cmd_data_ingest)
+
+    p_rates = sub.add_parser(
+        "rates-ingest",
+        help=(
+            "FRED -> parquet rate store via the caching FredRateRepo "
+            "(needs FRED_API_KEY; same no-double-download policy as bars)."
+        ),
+    )
+    p_rates.add_argument(
+        "--base-uri", default="data/local/rates", help="rate-observation store base uri"
+    )
+    p_rates.add_argument(
+        "--start",
+        default=None,
+        help="ISO-8601 start date (inclusive); defaults to bootstrap_start",
+    )
+    p_rates.add_argument("--end", required=True, help="ISO-8601 end date (exclusive)")
+    p_rates.add_argument(
+        "--bootstrap-start",
+        default="2000-01-01",
+        help="max-history floor for first-time pulls (CEO: bootstrap with max range available).",
+    )
+    p_rates.add_argument(
+        "--series",
+        nargs="*",
+        default=None,
+        help="FRED series ids to pull; defaults to the full FIRF catalog (SOFR + DGS + DFII).",
+    )
+    p_rates.set_defaults(func=_cmd_rates_ingest)
 
     return p
 
