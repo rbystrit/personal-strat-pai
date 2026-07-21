@@ -2,7 +2,7 @@
 
 Flat Momentum Strategy trading system — IBKR execution, Oracle Cloud durable storage, polars-first data layer.
 
-**Status:** Phase 0 (P0-1 foundation). No live capital. No IBKR. Paper trading only after CEO sign-off (plan §17, D10).
+**Status:** Phase 0 (P0-2 state plane). No live capital. No IBKR. Paper trading only after CEO sign-off (plan §17, D10).
 
 ## Quickstart
 
@@ -18,17 +18,40 @@ uv run python -m personal_strat_pai.cli --help
 
 CI runs `uv sync --frozen && uv run pytest` + ruff + mypy + gitleaks on every PR.
 
+The `oci` SDK is an OPTIONAL extra (the OCI NoSQL backend + provisioner). The
+default `uv sync --extra dev` install (CI) uses the in-memory NoSQL backend and
+does NOT pull the heavy `oci` SDK:
+
+```bash
+uv sync --extra oci           # add the OCI SDK for the real tenancy / provisioner
+```
+
 ## Layout
 
 ```
 src/personal_strat_pai/
   data/        # polars-first data layer (D14): caching, repo (bars), fred, rates (FredRateRepo + FredRatesProvider),
                #                store (BarStore + RateSeriesStore), databento, yfinance, polars_utils, iv_proxy (HV/IBKR), corp_actions, quality
+  state/       # P0-2: NoSQL state plane (plan §8, D5)
+               #   nosql   — InMemoryNoSqlStore + OciNoSqlStore; conditional writes (put_if_absent /
+               #              update_if_version / update_if_condition / delete_if_version) are the atomicity
+               #              boundary for HIFO lot closure + triplet slot advance.
+               #   ledger  — HIFO tax-lot selection (highest-cost-first) + ST(<365d)/LT(>=365d) split at the
+               #              lot level (brief §1). Pure functions, hypothesis property-tested.
+               #   triplet — A->B->C state machine + 60-day immunization + 30-day wash-sale restricted slot
+               #              + append-only slot_history (brief §1, plan §8). Pure transitions + NoSQL fence.
+  exec/        # P0-2: exec/lease.py is the v1 NO-OP STUB (D12 — single writer, no fencing). The
+               #   IBKR session, router, and target_portfolio modules land in P0-3/P0-4.
+  infra/oci/   # P0-2: v1 STORAGE-plane NoSQL table provisioning (Python; 8 tables; NO execution_lease — D12).
+               #   provision.py is the CLI: `uv run python -m personal_strat_pai.infra.oci.provision --dry-run`.
   config.py    # pydantic-settings loaders for config/*.yaml
   cli.py       # entrypoints (config-show, data-check, data-ingest, rates-ingest)
 config/
   universe.yaml  strategy.yaml  risk_limits.yaml   # parametrized (D7); # CEO-SET markers on D8 values
 tests/
+  state/       # nosql conditional-write tests + HIFO + triplet hypothesis property tests + cross-module atomicity
+  exec/        # exec/lease.py v1 no-op stub tests
+  infra/       # provision_all idempotency + D12 fence (execution_lease rejected)
 .github/workflows/ci.yml
 ```
 
@@ -41,6 +64,41 @@ See `docs/technical-design.md` (committed from the approved RBY-2 plan rev 6) fo
 - Never leak a `LazyFrame` across a module API or into a pre-trade check.
 - `data/polars_utils.py` centralizes the lazy/eager boundary.
 - The lazy-vs-eager property test (`tests/test_polars_lazy_eager.py`) is a MUST-PASS footgun guard.
+
+## State plane (P0-2; plan §8, D5)
+
+System of record = **Oracle NoSQL Database Cloud Service**. Local SQLite is a
+read-through cache. The atomicity boundary is NoSQL conditional writes
+(`put_if_absent`, `update_if_version`, `update_if_condition`):
+HIFO lot closure and triplet slot advance are each guarded by a conditional
+write, so two concurrent stop-outs on the same bucket cannot double-close a
+lot or double-advance a slot.
+
+v1 STORAGE-plane tables (provisioned by `infra/oci/nosql_tables.py`):
+`tax_lots`, `positions`, `triplet_state`, `realized_pnl`, `order_intent`,
+`risk_state`, `ibkr_session`, `sec_compliance`. The `execution_lease` table is
+**NOT created in v1** (D12 — single writer, no fencing); `exec/lease.py` is a
+no-op stub wired in v2 / P0-5.
+
+CI uses `InMemoryNoSqlStore` (an exact mirror of the conditional-write
+semantics) so the hypothesis property tests run without the `oci` SDK. The
+hypothesis property tests (HIFO qty/proceeds conservation; triplet never
+re-enters inside the 60d immunization window; NoSQL conditional-write
+transition atomicity) are the plan §16 acceptance criteria.
+
+### Provisioning the v1 NoSQL tables (CEO-gated)
+
+Creating NoSQL tables incurs a small monthly cost; the first real provision
+requires CEO sign-off. The provisioner is idempotent and Python (no Terraform)
+to keep the v1 toolchain single-language:
+
+```bash
+# Dry-run: prints the 8 tables + DDL without touching the tenancy.
+uv run --extra oci python -m personal_strat_pai.infra.oci.provision --dry-run
+
+# Real run (after CEO sign-off): requires OCI_NOSQL_COMPARTMENT_ID.
+uv run --extra oci python -m personal_strat_pai.infra.oci.provision --compartment-id ocid1.compartment.oc1...
+```
 
 ## Live data
 
