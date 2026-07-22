@@ -1,7 +1,7 @@
 """Oracle NoSQL access — tables, indexes, conditional writes (plan §8, D5).
 
 System of record = Oracle NoSQL Database Cloud Service, accessed via the
-``oci-nosqldb`` SDK (part of the ``oci`` package). Local SQLite is a read-through
+``oci.nosql`` module (part of the ``oci`` package). Local SQLite is a read-through
 cache for regenerable data (compliance whitelist, conId map, recent bars); the
 authoritative state — tax lots, positions, triplet state, realized P&L, order
 intents, risk state, IBKR session, SEC compliance — lives in NoSQL. **No
@@ -530,7 +530,7 @@ class OciNoSqlStore:
         self.profile = profile
         # NoSQL table compartment can differ from the resource compartment; default to it.
         self.table_compartment_id = table_compartment_id or compartment_id
-        self._client: Any = None  # oci.nosqldb.NosqldbClient, created lazily
+        self._client: Any = None  # oci.nosql.NosqlClient, created lazily
         self._table_schemas: dict[str, dict[str, str]] = {}
 
     # --- lazy SDK bootstrap --- #
@@ -555,7 +555,7 @@ class OciNoSqlStore:
             import oci
 
             cfg = self._load_config()
-            self._client = oci.nosqldb.NosqldbClient(cfg)
+            self._client = oci.nosql.NosqlClient(cfg)
         return self._client
 
     # --- admin --- #
@@ -579,11 +579,15 @@ class OciNoSqlStore:
         cap = (
             dict(capacity)
             if capacity is not None
-            else {"mode": "PROVISIONED", "read_units": 1, "write_units": 1}
+            else {
+                "mode": "PROVISIONED",
+                "read_units": 1,
+                "write_units": 1,
+                "max_storage_in_g_bs": 1,
+            }
         )
-        # NoSQL key schema: a list of {name, type} where type is one of
-        # STRING / INTEGER / LONG / DOUBLE / BINARY. We accept Python short
-        # types (str, int, float, bytes) and map them.
+        # NoSQL key schema: the DDL statement below carries the column
+        # definitions and PRIMARY KEY inline — no separate schema object.
         type_map = {
             "str": "STRING",
             "int": "INTEGER",
@@ -591,9 +595,6 @@ class OciNoSqlStore:
             "float": "DOUBLE",
             "bytes": "BINARY",
         }
-        ddl_keys = [
-            {"name": k, "type": type_map.get(v, str(v).upper())} for k, v in key_schema.items()
-        ]
 
         # Idempotency: list tables first; if present with matching keys, no-op.
         try:
@@ -604,18 +605,15 @@ class OciNoSqlStore:
             if getattr(e, "status", None) not in (404, "404"):
                 raise
 
-        details = oci.nosqldb.models.CreateTableDetails(
+        details = oci.nosql.models.CreateTableDetails(
             name=table,
             compartment_id=self.table_compartment_id,
             ddl_statement=f"CREATE TABLE {table} ({', '.join(f'{k} {type_map.get(v, str(v).upper())}' for k, v in key_schema.items())}, PRIMARY KEY ({', '.join(key_schema)}))",
-            ddl_type="CREATE",
-            table_schema=oci.nosqldb.models.TableSchema(
-                primary_key=ddl_keys,
-            ),
-            capacity=oci.nosqldb.models.Capacity(
-                mode=cap.get("mode", "PROVISIONED"),
-                read_units=cap.get("read_units", 1),
-                write_units=cap.get("write_units", 1),
+            table_limits=oci.nosql.models.TableLimits(
+                capacity_mode=cap.get("mode", "PROVISIONED"),
+                max_read_units=cap.get("read_units", 1),
+                max_write_units=cap.get("write_units", 1),
+                max_storage_in_g_bs=cap.get("max_storage_in_g_bs", 1),
             ),
         )
         client.create_table(create_table_details=details)
@@ -631,26 +629,31 @@ class OciNoSqlStore:
     def _key_dict(self, key: Mapping[str, Any]) -> dict[str, Any]:
         return dict(key)
 
+    @staticmethod
+    def _key_list(key: Mapping[str, Any]) -> list[str]:
+        """Convert a key mapping to the OCI NoSQL ``["col:val", ...]`` format."""
+        return [f"{k}:{v}" for k, v in key.items()]
+
     def get(self, table: str, key: Mapping[str, Any]) -> Row | None:
         client = self._ensure_client()
         try:
             resp = client.get_row(
                 table_name_or_id=table,
+                key=self._key_list(key),
                 compartment_id=self.table_compartment_id,
-                key=self._key_dict(key),
             )
         except Exception as e:
             # Missing row: NoSQL returns a 404 / specific error; normalize to None.
             if "InternalServerError" in type(e).__name__ or "NotFound" in type(e).__name__:
                 return None
             raise
-        row_value = resp.data.value if hasattr(resp, "data") and resp.data is not None else None
-        version = resp.data.version if hasattr(resp, "data") and resp.data is not None else None
-        if row_value is None:
+        row_data = resp.data if hasattr(resp, "data") and resp.data is not None else None
+        if row_data is None or row_data.value is None:
             return None
-        # NoSQL version is a bytes blob; encode as hex string for opaque comparison.
-        version_str = version.hex() if isinstance(version, (bytes, bytearray)) else str(version)
-        return Row(payload=dict(row_value), version=version_str)
+        # NoSQL row version is the etag from the response headers.
+        version = resp.headers.get("etag") if hasattr(resp, "headers") else None
+        version_str = str(version) if version is not None else "v0"
+        return Row(payload=dict(row_data.value), version=version_str)
 
     def query(
         self,
@@ -660,6 +663,8 @@ class OciNoSqlStore:
         limit: int | None = None,
     ) -> list[Row]:
         client = self._ensure_client()
+        import oci
+
         if isinstance(where, str):
             stmt = f"SELECT * FROM {table} WHERE {where}"
         else:
@@ -668,7 +673,7 @@ class OciNoSqlStore:
         if limit is not None:
             stmt += f" LIMIT {int(limit)}"
         resp = client.query(
-            query_details=__import__("oci").nosqldb.models.QueryDetails(
+            query_details=oci.nosql.models.QueryDetails(
                 compartment_id=self.table_compartment_id, statement=stmt
             )
         )
@@ -678,11 +683,7 @@ class OciNoSqlStore:
             payload = {
                 k: v for k, v in (item.items() if isinstance(item, dict) else []) if k != "version"
             }
-            version_str = (
-                version.hex()
-                if isinstance(version, (bytes, bytearray))
-                else (str(version) if version is not None else "v0")
-            )
+            version_str = str(version) if version is not None else "v0"
             out.append(Row(payload=payload, version=version_str))
         return out
 
@@ -692,13 +693,13 @@ class OciNoSqlStore:
 
         value = dict(row)
         value.update(self._key_dict(key))
-        details = oci.nosqldb.models.PutRowDetails(
+        details = oci.nosql.models.UpdateRowDetails(
             value=value,
-            put_option="IF_ABSENT",
+            option=oci.nosql.models.UpdateRowDetails.OPTION_IF_ABSENT,
             compartment_id=self.table_compartment_id,
         )
         try:
-            resp = client.put_row(table_name_or_id=table, put_row_details=details)
+            resp = client.update_row(table_name_or_id=table, update_row_details=details)
         except oci.exceptions.ServiceError as e:
             raise ConditionalCheckFailed(table, key, "row already exists") from e
         return self._row_from_response(resp, key)
@@ -715,16 +716,17 @@ class OciNoSqlStore:
 
         value = dict(row)
         value.update(self._key_dict(key))
-        # expected_version may be a hex string from a previous get; the SDK wants bytes.
-        existing_version = self._decode_version(expected_version)
-        details = oci.nosqldb.models.PutRowDetails(
+        details = oci.nosql.models.UpdateRowDetails(
             value=value,
-            put_option="IF_VERSION",
-            existing_version=existing_version,
+            option=oci.nosql.models.UpdateRowDetails.OPTION_IF_PRESENT,
             compartment_id=self.table_compartment_id,
         )
         try:
-            resp = client.put_row(table_name_or_id=table, put_row_details=details)
+            resp = client.update_row(
+                table_name_or_id=table,
+                update_row_details=details,
+                if_match=expected_version,
+            )
         except oci.exceptions.ServiceError as e:
             raise ConditionalCheckFailed(
                 table,
@@ -779,16 +781,12 @@ class OciNoSqlStore:
         client = self._ensure_client()
         import oci
 
-        existing_version = self._decode_version(expected_version)
-        details = oci.nosqldb.models.DeleteRowDetails(
-            compartment_id=self.table_compartment_id,
-            is_get_return_row=True,
-        )
         try:
             client.delete_row(
                 table_name_or_id=table,
-                delete_row_details=details,
-                existing_version=existing_version,
+                key=self._key_list(key),
+                compartment_id=self.table_compartment_id,
+                if_match=expected_version,
             )
         except oci.exceptions.ServiceError as e:
             raise ConditionalCheckFailed(
@@ -801,24 +799,17 @@ class OciNoSqlStore:
     # --- helpers --- #
 
     @staticmethod
-    def _decode_version(version: str) -> bytes:
-        try:
-            return bytes.fromhex(version)
-        except ValueError:
-            # Not a hex string; treat as opaque passthrough encoded as utf-8.
-            return version.encode("utf-8")
-
-    @staticmethod
     def _row_from_response(resp: Any, key: Mapping[str, Any]) -> Row:
         data = getattr(resp, "data", None)
+        headers = getattr(resp, "headers", None)
+        # Etag from response headers is the row version (used by if_match).
+        etag = headers.get("etag") if headers else None
         if data is None:
-            return Row(payload=dict(key), version="v0")
+            return Row(payload=dict(key), version=str(etag) if etag else "v0")
+        # UpdateRowResult has a `value` attr; Row has a `value` attr too.
         value = getattr(data, "value", None) or {}
-        version = getattr(data, "version", None)
+        # UpdateRowResult also has a `version` field; fall back to etag.
+        version = getattr(data, "version", None) or etag
         payload = {k: v for k, v in dict(value).items() if k != "version"}
-        version_str = (
-            version.hex()
-            if isinstance(version, (bytes, bytearray))
-            else (str(version) if version is not None else "v0")
-        )
+        version_str = str(version) if version is not None else "v0"
         return Row(payload=payload, version=version_str)

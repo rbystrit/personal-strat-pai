@@ -61,7 +61,9 @@ class TableSchema:
 
     name: str
     key_schema: dict[str, str]
-    capacity: dict[str, int] = field(default_factory=lambda: {"read_units": 1, "write_units": 1})
+    capacity: dict[str, int] = field(
+        default_factory=lambda: {"read_units": 1, "write_units": 1, "max_storage_in_g_bs": 1}
+    )
 
 
 # --- v1 STORAGE-plane table schemas --- #
