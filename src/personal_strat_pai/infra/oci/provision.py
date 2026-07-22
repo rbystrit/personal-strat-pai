@@ -38,7 +38,8 @@ def _print_table(name: str, schema: Any) -> None:
     keys = ", ".join(f"{k}:{v}" for k, v in schema.key_schema.items())
     cap = (
         f"read={schema.capacity.get('read_units', 1)}u, "
-        f"write={schema.capacity.get('write_units', 1)}u"
+        f"write={schema.capacity.get('write_units', 1)}u, "
+        f"storage={schema.capacity.get('max_storage_in_g_bs', 1)}GB"
     )
     print(f"  - {name:<20} PK({keys})  capacity={cap}")
 
