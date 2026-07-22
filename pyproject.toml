@@ -34,6 +34,12 @@ dev = [
     "ruff>=0.7",
     "mypy>=1.13",
 ]
+# OCI backend (plan §3.2, §8, §15). Required only for the real NoSQL store and
+# the infra/oci/ provisioner; CI uses the in-memory NoSqlStore backend so the
+# default `uv sync --extra dev` install does NOT pull the heavy `oci` SDK.
+oci = [
+    "oci>=2.133",            # Oracle Cloud SDK — includes oci-nosqldb (plan §5, D5)
+]
 
 [project.scripts]
 personal-strat-pai = "personal_strat_pai.cli:main"
@@ -68,6 +74,14 @@ ignore = [
 # CLI deliberately defers heavy data-stack imports so trivial subcommands
 # (config-show) stay fast; PLC0415 (import outside top-level) is intentional.
 "src/personal_strat_pai/cli.py" = ["PLC0415"]
+# State plane + infra: the `oci` SDK is an OPTIONAL dep (pyproject `oci` extra)
+# so the OCI backend + provisioner must lazy-import it to keep `uv sync --extra dev`
+# (CI) importable without the heavy SDK. The LedgerError lazy import in
+# triplet.py avoids a circular import (ledger -> nosql, triplet -> nosql,
+# triplet -> ledger via LedgerError). All intentional.
+"src/personal_strat_pai/state/nosql.py" = ["PLC0415"]
+"src/personal_strat_pai/state/triplet.py" = ["PLC0415"]
+"src/personal_strat_pai/infra/oci/provision.py" = ["PLC0415"]
 
 [tool.ruff.format]
 docstring-code-format = true
@@ -92,6 +106,18 @@ module = [
     "scipy.*",
     "yaml.*",
     "pandas.*",
+    "oci.*",
+    "oci.exceptions.*",
+    "oci.nosqldb.*",
+    "oci.identity.*",
+    "oci.object_storage.*",
+    "oci.retry.*",
+    "oci.base_client.*",
+    "oci.response.*",
+    "oci.util.*",
+    "oci.auth.*",
+    "oci.config.*",
+    "oci.client.*",
 ]
 ignore_missing_imports = true
 
