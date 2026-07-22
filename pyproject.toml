@@ -82,6 +82,17 @@ ignore = [
 "src/personal_strat_pai/state/nosql.py" = ["PLC0415"]
 "src/personal_strat_pai/state/triplet.py" = ["PLC0415"]
 "src/personal_strat_pai/infra/oci/provision.py" = ["PLC0415"]
+# Backtest engine: deferred imports avoid circular deps (metrics -> portfolio,
+# manifest -> config); __all__ is grouped by module with comments; _rebalance
+# and compute_stats are intentionally detailed.
+"src/personal_strat_pai/backtest/engine.py" = ["PLC0415", "PLR0912", "PLR0915", "SIM108"]
+"src/personal_strat_pai/backtest/risk.py" = ["SIM102", "RUF022"]
+"src/personal_strat_pai/backtest/metrics.py" = ["PLR0915", "RUF022"]
+"src/personal_strat_pai/backtest/reports.py" = ["PLC0415"]
+"src/personal_strat_pai/backtest/costs.py" = ["SIM108"]
+"src/personal_strat_pai/backtest/portfolio.py" = ["RUF022"]
+"src/personal_strat_pai/backtest/signals.py" = ["RUF022"]
+"src/personal_strat_pai/backtest/__init__.py" = ["RUF022"]
 
 [tool.ruff.format]
 docstring-code-format = true
@@ -119,6 +130,10 @@ module = [
     "oci.config.*",
     "oci.client.*",
 ]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "quantstats"
 ignore_missing_imports = true
 
 # --- pytest --- #
